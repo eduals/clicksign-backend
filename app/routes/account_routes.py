@@ -1,11 +1,33 @@
 from flask import Blueprint, request, jsonify
 from datetime import datetime, timedelta
+from sqlalchemy import text
 from app.database import db
 from app.models import Account
 from app.auth import require_auth
 from app.config import Config
 
 bp = Blueprint('account', __name__, url_prefix='/api/account')
+
+@bp.route('/health', methods=['GET'])
+def healthcheck():
+    """Healthcheck endpoint para verificar se a API está online"""
+    try:
+        # Testar conexão com o banco de dados
+        db.session.execute(text('SELECT 1'))
+        
+        return jsonify({
+            'status': 'healthy',
+            'message': 'API is online and database connection is working',
+            'timestamp': datetime.utcnow().isoformat()
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'message': 'API is online but database connection failed',
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 503
 
 @bp.route('/<portal_id>', methods=['GET'])
 @require_auth

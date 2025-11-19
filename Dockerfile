@@ -6,7 +6,12 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     gcc \
     postgresql-client \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Copiar e instalar certificado SSL
+COPY certificates/ca-certificate.crt /usr/local/share/ca-certificates/ca-certificate.crt
+RUN update-ca-certificates
 
 # Copiar requirements e instalar dependências Python
 COPY requirements.txt .

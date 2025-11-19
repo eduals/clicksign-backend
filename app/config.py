@@ -4,9 +4,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+def normalize_database_url(url):
+    """Normaliza a URL do banco para usar o driver psycopg2"""
+    if url.startswith('postgres://'):
+        return url.replace('postgres://', 'postgresql+psycopg2://', 1)
+    elif url.startswith('postgresql://') and '+psycopg2' not in url:
+        return url.replace('postgresql://', 'postgresql+psycopg2://', 1)
+    return url
+
 class Config:
     # Database
-    SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URL', 'postgresql://user:password@localhost:5432/clicksign_db')
+    _db_url = os.getenv('DATABASE_URL', 'postgresql://user:password@localhost:5432/clicksign_db')
+    SQLALCHEMY_DATABASE_URI = normalize_database_url(_db_url)
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     
     # Security
