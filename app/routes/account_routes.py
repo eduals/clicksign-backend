@@ -69,7 +69,10 @@ def create_account(portal_id):
             }), 409
         
         # Obter clicksign_api_key do body se fornecido
-        data = request.get_json() or {}
+        # Usar force=True para forçar parse do JSON mesmo sem Content-Type header
+        data = request.get_json(force=True, silent=True) or {}
+        if not isinstance(data, dict):
+            data = {}
         clicksign_api_key = data.get('clicksign_api_key')
         
         # Criar nova conta
@@ -100,9 +103,12 @@ def create_account(portal_id):
 def update_clicksign_key(portal_id):
     """Salva/atualiza API key do Clicksign"""
     try:
-        data = request.get_json()
+        # Usar force=True para forçar parse do JSON mesmo sem Content-Type header
+        # e silent=True para retornar None em vez de lançar exceção
+        data = request.get_json(force=True, silent=True)
         
-        if not data or 'clicksign_api_key' not in data:
+        # Verificar se data é um dicionário válido
+        if not data or not isinstance(data, dict) or 'clicksign_api_key' not in data:
             return jsonify({
                 'error': 'Missing required field',
                 'message': 'clicksign_api_key é obrigatório no body'
