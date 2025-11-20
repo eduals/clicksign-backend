@@ -129,7 +129,12 @@ def update_clicksign_key(portal_id):
                 
                 if body_str and body_str.strip():
                     # Tentar fazer parse direto
-                    data = json.loads(body_str)
+                    parsed = json.loads(body_str)
+                    # Se o resultado for uma string, fazer parse novamente (caso de double encoding)
+                    if isinstance(parsed, str):
+                        data = json.loads(parsed)
+                    else:
+                        data = parsed
             except (json.JSONDecodeError, ValueError, TypeError, AttributeError, UnicodeDecodeError):
                 pass
         
