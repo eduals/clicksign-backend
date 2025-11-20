@@ -104,24 +104,59 @@ def create_account(portal_id):
 def update_clicksign_key(portal_id):
     """Salva/atualiza API key do Clicksign"""
     try:
-        # Tentar obter JSON do request
-        data = request.get_json(force=True, silent=True)
+        # Debug: ver o que está chegando
+        print(f"DEBUG - Content-Type: {request.content_type}")
+        print(f"DEBUG - Headers: {dict(request.headers)}")
         
-        # Se não conseguir fazer parse, tentar manualmente
-        if not data or not isinstance(data, dict):
+        # Tentar obter o body como string primeiro
+        body_str = request.get_data(as_text=True)
+        print(f"DEBUG - Body as string: {body_str}")
+        print(f"DEBUG - Body type: {type(body_str)}")
+        
+        data = None
+        
+        # Tentar fazer parse do JSON
+        if body_str:
             try:
-                # Tentar obter o body como string e fazer parse manual
-                body_str = request.get_data(as_text=True)
-                if body_str:
-                    data = json.loads(body_str)
-            except (json.JSONDecodeError, ValueError, TypeError):
-                data = None
+                data = json.loads(body_str)
+                print(f"DEBUG - Parsed data: {data}")
+                print(f"DEBUG - Data type: {type(data)}")
+            except (json.JSONDecodeError, ValueError, TypeError) as e:
+                print(f"DEBUG - JSON parse error: {e}")
+                # Tentar com request.get_json como fallback
+                try:
+                    data = request.get_json(force=True, silent=True)
+                    print(f"DEBUG - Fallback get_json result: {data}")
+                except Exception as e2:
+                    print(f"DEBUG - Fallback error: {e2}")
+        
+        # Se ainda não tiver data, tentar request.get_json diretamente
+        if not data:
+            data = request.get_json(force=True, silent=True)
+            print(f"DEBUG - Direct get_json result: {data}")
         
         # Verificar se data é um dicionário válido
-        if not data or not isinstance(data, dict) or 'clicksign_api_key' not in data:
+        if not data or not isinstance(data, dict):
+            print(f"DEBUG - Data is invalid: {data}, type: {type(data)}")
             return jsonify({
                 'error': 'Missing required field',
-                'message': 'clicksign_api_key é obrigatório no body'
+                'message': 'clicksign_api_key é obrigatório no body',
+                'debug': {
+                    'body_received': body_str[:200] if body_str else None,
+                    'content_type': request.content_type,
+                    'data_type': str(type(data)) if data else None
+                }
+            }), 400
+        
+        if 'clicksign_api_key' not in data:
+            print(f"DEBUG - clicksign_api_key not in data. Keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
+            return jsonify({
+                'error': 'Missing required field',
+                'message': 'clicksign_api_key é obrigatório no body',
+                'debug': {
+                    'data_keys': list(data.keys()) if isinstance(data, dict) else None,
+                    'data': data
+                }
             }), 400
         
         clicksign_api_key = data['clicksign_api_key']
