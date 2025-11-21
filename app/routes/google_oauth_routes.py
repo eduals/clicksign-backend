@@ -260,7 +260,19 @@ def callback():
             if not code_verifier:
                 logger.warning(f"Code verifier não encontrado ou expirado para state: {state}")
         
-        # Criar flow inicial com scopes
+        # Determinar scopes a usar
+        # Se scope_param estiver disponível, usar os scopes retornados pelo Google
+        # Caso contrário, usar os scopes padrão
+        if scope_param:
+            # Usar scopes retornados pelo Google
+            scopes_to_use = scope_param.split()
+            logger.info(f"Usando scopes do callback: {scopes_to_use}")
+        else:
+            # Usar scopes padrão
+            scopes_to_use = SCOPES
+            logger.info(f"Usando scopes padrão: {scopes_to_use}")
+        
+        # Criar flow com scopes corretos desde o início
         flow = Flow.from_client_config(
             {
                 "web": {
@@ -271,55 +283,19 @@ def callback():
                     "redirect_uris": [redirect_uri]
                 }
             },
-            scopes=SCOPES,
+            scopes=scopes_to_use,  # Usar scopes do callback ou padrão
             redirect_uri=redirect_uri
         )
         
         # Trocar código por tokens com PKCE
-        try:
-            if code_verifier:
-                # Usar PKCE se code_verifier disponível
-                flow.fetch_token(code=code, code_verifier=code_verifier)
-            else:
-                # Fallback sem PKCE (para compatibilidade com tokens antigos)
-                logger.warning("PKCE code_verifier não disponível, usando fluxo sem PKCE")
-                flow.fetch_token(code=code)
-        except Exception as e:
-            # Se falhar por causa de scopes diferentes, recriar flow sem scopes fixos
-            error_str = str(e)
-            if 'scope' in error_str.lower() or 'Scope' in error_str:
-                logger.warning(f"Scope mismatch detected, recreating flow without fixed scopes: {error_str}")
-                
-                # Extrair scopes do callback se disponível, senão usar lista vazia
-                callback_scopes = []
-                if scope_param:
-                    # scope_param vem como string separada por espaços
-                    callback_scopes = scope_param.split()
-                elif 'scope' in error_str:
-                    # Tentar extrair scopes do erro se disponível
-                    # Usar lista vazia como fallback para aceitar qualquer scope
-                    callback_scopes = []
-                
-                # Recriar flow com os scopes do callback ou lista vazia
-                flow = Flow.from_client_config(
-                    {
-                        "web": {
-                            "client_id": client_id,
-                            "client_secret": client_secret,
-                            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                            "token_uri": "https://oauth2.googleapis.com/token",
-                            "redirect_uris": [redirect_uri]
-                        }
-                    },
-                    scopes=callback_scopes,  # Adicionar argumento scopes faltante
-                    redirect_uri=redirect_uri
-                )
-                if code_verifier:
-                    flow.fetch_token(code=code, code_verifier=code_verifier)
-                else:
-                    flow.fetch_token(code=code)
-            else:
-                raise
+        # O flow já foi criado com os scopes corretos, então não deve haver scope mismatch
+        if code_verifier:
+            # Usar PKCE se code_verifier disponível
+            flow.fetch_token(code=code, code_verifier=code_verifier)
+        else:
+            # Fallback sem PKCE (para compatibilidade com tokens antigos)
+            logger.warning("PKCE code_verifier não disponível, usando fluxo sem PKCE")
+            flow.fetch_token(code=code)
         
         credentials = flow.credentials
         
