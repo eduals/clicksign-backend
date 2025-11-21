@@ -1,0 +1,154 @@
+from functools import wraps
+from flask import request, jsonify, g
+from app.config import Config
+from app.models import User, Organization
+from app.database import db
+import uuid
+
+def require_auth(f):
+    """Decorator para exigir autenticação Bearer token"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        
+        if not auth_header:
+            return jsonify({
+                'error': 'Authorization header missing',
+                'message': 'Bearer token é obrigatório'
+            }), 401
+        
+        try:
+            # Formato esperado: "Bearer {token}"
+            token_type, token = auth_header.split(' ', 1)
+            
+            if token_type.lower() != 'bearer':
+                return jsonify({
+                    'error': 'Invalid authorization type',
+                    'message': 'Tipo de autorização deve ser Bearer'
+                }), 401
+            
+            # Validar token
+            if token != Config.BACKEND_API_TOKEN:
+                return jsonify({
+                    'error': 'Invalid token',
+                    'message': 'Token inválido'
+                }), 401
+            
+            # Armazenar token no contexto
+            g.token = token
+            
+        except ValueError:
+            return jsonify({
+                'error': 'Invalid authorization header format',
+                'message': 'Formato do header Authorization inválido. Use: Bearer {token}'
+            }), 401
+        
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
+
+def require_org(f):
+    """Decorator para exigir organização no contexto (via portal_id ou organization_id)"""
+    @require_auth
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Tentar obter organization_id de várias formas
+        organization_id = None
+        
+        # 1. Diretamente do request (query param ou body)
+        if request.args.get('organization_id'):
+            organization_id = request.args.get('organization_id')
+        elif request.is_json and request.get_json():
+            organization_id = request.get_json().get('organization_id')
+        
+        # 2. Via portal_id (compatibilidade com código antigo)
+        portal_id = None
+        if request.args.get('portal_id'):
+            portal_id = request.args.get('portal_id')
+        elif request.is_json and request.get_json():
+            portal_id = request.get_json().get('portal_id')
+        
+        if portal_id:
+            # Buscar organização pelo portal_id (via connection)
+            from app.models import DataSourceConnection
+            connection = DataSourceConnection.query.filter_by(
+                source_type='hubspot',
+                config={'portal_id': portal_id}
+            ).first()
+            
+            if connection:
+                organization_id = str(connection.organization_id)
+        
+        # 3. Se ainda não encontrou, criar organização temporária baseada no portal_id
+        if not organization_id and portal_id:
+            # Para compatibilidade, criar organização on-the-fly se não existir
+            # TODO: Migrar dados existentes para organizações
+            org = Organization.query.filter_by(slug=f"portal-{portal_id}").first()
+            if not org:
+                org = Organization(
+                    name=f"Portal {portal_id}",
+                    slug=f"portal-{portal_id}",
+                    plan='free'
+                )
+                db.session.add(org)
+                db.session.commit()
+            organization_id = str(org.id)
+        
+        if not organization_id:
+            return jsonify({
+                'error': 'Organization not found',
+                'message': 'organization_id ou portal_id é obrigatório'
+            }), 400
+        
+        # Validar que organização existe
+        try:
+            org = Organization.query.filter_by(id=organization_id).first_or_404()
+            g.organization_id = organization_id
+            g.organization = org
+        except Exception as e:
+            return jsonify({
+                'error': 'Invalid organization',
+                'message': 'Organização não encontrada'
+            }), 404
+        
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
+
+def require_admin(f):
+    """Decorator para exigir que usuário seja admin"""
+    @require_org
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Tentar obter user_id
+        user_id = None
+        if request.args.get('user_id'):
+            user_id = request.args.get('user_id')
+        elif request.is_json and request.get_json():
+            user_id = request.get_json().get('user_id')
+        
+        # Se não tem user_id, permitir (para compatibilidade)
+        if not user_id:
+            return f(*args, **kwargs)
+        
+        # Verificar se usuário é admin
+        user = User.query.filter_by(
+            id=user_id,
+            organization_id=g.organization_id
+        ).first()
+        
+        if not user or not user.is_admin():
+            return jsonify({
+                'error': 'Permission denied',
+                'message': 'Acesso negado. Apenas administradores podem realizar esta ação.'
+            }), 403
+        
+        g.user_id = user_id
+        g.user = user
+        
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
