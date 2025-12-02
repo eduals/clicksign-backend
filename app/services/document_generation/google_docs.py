@@ -67,17 +67,25 @@ class GoogleDocsService:
     ) -> None:
         """
         Substitui todas as tags no documento pelos valores correspondentes.
+        Processa tanto tags normais quanto tags AI ({{ai:...}}).
         
         Args:
             document_id: ID do documento
-            data: Dados para substituição
+            data: Dados para substituição (pode conter valores gerados por IA com chaves 'ai:tag_name')
             mappings: Mapeamento de tags para campos
         """
         doc = self.get_document_content(document_id)
-        tags = self.extract_tags_from_document(document_id)
+        text = self._extract_text_from_content(doc.get('body', {}).get('content', []))
+        
+        # Extrair tags normais (sem ai:)
+        tags = TagProcessor.extract_tags(text)
+        
+        # Extrair tags AI
+        ai_tags = TagProcessor.extract_ai_tags(text)
         
         requests = []
         
+        # Processar tags normais
         for tag in tags:
             # Busca o campo mapeado ou usa o próprio tag
             field = mappings.get(tag, tag) if mappings else tag
@@ -94,6 +102,28 @@ class GoogleDocsService:
                 'replaceAllText': {
                     'containsText': {
                         'text': '{{' + tag + '}}',
+                        'matchCase': True
+                    },
+                    'replaceText': value
+                }
+            })
+        
+        # Processar tags AI
+        for ai_tag in ai_tags:
+            # A chave no data será 'ai:tag_name'
+            tag_key = f'ai:{ai_tag}'
+            value = data.get(tag_key)
+            
+            if value is None:
+                # Se não encontrou, tenta buscar diretamente pelo nome da tag
+                value = data.get(ai_tag, '')
+            
+            value = str(value) if value is not None else ''
+            
+            requests.append({
+                'replaceAllText': {
+                    'containsText': {
+                        'text': '{{ai:' + ai_tag + '}}',
                         'matchCase': True
                     },
                     'replaceText': value
