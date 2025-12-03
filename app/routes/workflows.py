@@ -11,6 +11,44 @@ workflows_bp = Blueprint('workflows', __name__, url_prefix='/api/v1/workflows')
 AI_PROVIDERS = ['openai', 'gemini', 'anthropic']
 
 
+def validate_post_actions(post_actions):
+    """
+    Valida a estrutura de post_actions.
+    
+    Args:
+        post_actions: Dict com configurações de post_actions
+    
+    Returns:
+        Tuple (is_valid, error_message)
+    """
+    if not post_actions or not isinstance(post_actions, dict):
+        return True, None  # post_actions é opcional
+    
+    hubspot_config = post_actions.get('hubspot_attachment')
+    if not hubspot_config:
+        return True, None  # Não há configuração HubSpot, tudo OK
+    
+    if not isinstance(hubspot_config, dict):
+        return False, 'hubspot_attachment deve ser um objeto'
+    
+    # Validar enabled
+    if 'enabled' in hubspot_config and not isinstance(hubspot_config['enabled'], bool):
+        return False, 'hubspot_attachment.enabled deve ser um booleano'
+    
+    # Se enabled, validar attachment_type
+    if hubspot_config.get('enabled'):
+        attachment_type = hubspot_config.get('attachment_type', 'engagement')
+        if attachment_type not in ['engagement', 'property']:
+            return False, 'hubspot_attachment.attachment_type deve ser "engagement" ou "property"'
+        
+        # Se attachment_type é 'property', property_name é obrigatório
+        if attachment_type == 'property':
+            if not hubspot_config.get('property_name'):
+                return False, 'hubspot_attachment.property_name é obrigatório quando attachment_type é "property"'
+    
+    return True, None
+
+
 @workflows_bp.route('', methods=['GET'])
 @require_auth
 @require_org
@@ -77,6 +115,13 @@ def create_workflow():
         if not data.get(field):
             return jsonify({'error': f'{field} é obrigatório'}), 400
     
+    # Validar post_actions se fornecido
+    post_actions = data.get('post_actions')
+    if post_actions:
+        is_valid, error_msg = validate_post_actions(post_actions)
+        if not is_valid:
+            return jsonify({'error': error_msg}), 400
+    
     # Criar workflow
     workflow = Workflow(
         organization_id=g.organization_id,
@@ -131,6 +176,12 @@ def update_workflow(workflow_id):
     ).first_or_404()
     
     data = request.get_json()
+    
+    # Validar post_actions se fornecido
+    if 'post_actions' in data:
+        is_valid, error_msg = validate_post_actions(data['post_actions'])
+        if not is_valid:
+            return jsonify({'error': error_msg}), 400
     
     # Atualizar campos permitidos
     allowed_fields = [

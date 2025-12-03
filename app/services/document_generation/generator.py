@@ -202,6 +202,7 @@ class DocumentGenerator:
             )
             
             # Gerar PDF se configurado
+            pdf_bytes = None
             if workflow.create_pdf:
                 pdf_bytes = self.google_docs.export_as_pdf(new_doc['id'])
                 pdf_result = self._upload_pdf(
@@ -213,6 +214,15 @@ class DocumentGenerator:
                 generated_doc.pdf_url = pdf_result['url']
             
             db.session.add(generated_doc)
+            
+            # Processar anexo HubSpot se configurado
+            self._process_hubspot_attachment(
+                workflow=workflow,
+                generated_doc=generated_doc,
+                source_object_id=source_object_id,
+                pdf_bytes=pdf_bytes,
+                doc_name=doc_name
+            )
             
             # Incrementar contador da organização
             org.increment_document_count()
@@ -497,4 +507,102 @@ class DocumentGenerator:
             return credentials.get('api_key')
         
         return None
+    
+    def _process_hubspot_attachment(
+        self,
+        workflow: Workflow,
+        generated_doc: GeneratedDocument,
+        source_object_id: str,
+        pdf_bytes: Optional[bytes],
+        doc_name: str
+    ) -> None:
+        """
+        Processa anexo do documento no HubSpot se configurado no workflow.
+        
+        Args:
+            workflow: Workflow com configurações
+            generated_doc: Documento gerado
+            source_object_id: ID do objeto na fonte
+            pdf_bytes: Bytes do PDF (None se não foi gerado)
+            doc_name: Nome do documento
+        """
+        # Verificar se anexo HubSpot está habilitado
+        post_actions = workflow.post_actions
+        if not post_actions or not isinstance(post_actions, dict):
+            return
+        
+        hubspot_config = post_actions.get('hubspot_attachment')
+        if not hubspot_config or not hubspot_config.get('enabled'):
+            return
+        
+        # Verificar se há conexão HubSpot configurada
+        connection = workflow.source_connection
+        if not connection or connection.source_type != 'hubspot':
+            logger.warning(f"Workflow {workflow.id} tem anexo HubSpot habilitado mas não tem conexão HubSpot configurada")
+            return
+        
+        # Verificar se PDF foi gerado (necessário para anexo)
+        if not pdf_bytes:
+            logger.warning(f"Workflow {workflow.id} tem anexo HubSpot habilitado mas PDF não foi gerado")
+            return
+        
+        try:
+            from app.services.data_sources.hubspot_attachments import HubSpotAttachmentService
+            
+            # Criar serviço de anexo
+            attachment_service = HubSpotAttachmentService(connection)
+            
+            # Fazer upload do arquivo
+            filename = f"{doc_name}.pdf"
+            file_result = attachment_service.upload_file(
+                file_bytes=pdf_bytes,
+                filename=filename,
+                mime_type='application/pdf',
+                access='PRIVATE'
+            )
+            
+            # Salvar informações do arquivo no documento
+            generated_doc.hubspot_file_id = file_result['id']
+            generated_doc.hubspot_file_url = file_result['url']
+            
+            # Anexar ao objeto
+            attachment_type = hubspot_config.get('attachment_type', 'engagement')
+            
+            if attachment_type == 'engagement':
+                # Anexar via engagement (NOTE)
+                note_body = hubspot_config.get('note_body', f'Documento gerado: {doc_name}')
+                engagement_result = attachment_service.attach_file_to_object(
+                    object_type=workflow.source_object_type,
+                    object_id=source_object_id,
+                    file_id=file_result['id'],
+                    note_body=note_body
+                )
+                generated_doc.hubspot_attachment_id = engagement_result.get('engagement_id')
+                
+            elif attachment_type == 'property':
+                # Atualizar propriedade customizada com URL do arquivo
+                property_name = hubspot_config.get('property_name')
+                if not property_name:
+                    logger.warning(f"Workflow {workflow.id} tem attachment_type='property' mas property_name não configurado")
+                else:
+                    attachment_service.update_object_property(
+                        object_type=workflow.source_object_type,
+                        object_id=source_object_id,
+                        property_name=property_name,
+                        property_value=file_result['url']
+                    )
+            
+            logger.info(
+                f"Documento {generated_doc.id} anexado ao HubSpot: "
+                f"object_type={workflow.source_object_type}, object_id={source_object_id}, "
+                f"file_id={file_result['id']}"
+            )
+            
+        except Exception as e:
+            # Não falhar a geração se anexo falhar, apenas logar
+            logger.error(
+                f"Erro ao anexar documento {generated_doc.id} no HubSpot: {str(e)}",
+                exc_info=True
+            )
+            # Não propagar exceção para não interromper o fluxo de geração
 

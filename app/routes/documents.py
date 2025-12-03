@@ -210,25 +210,7 @@ def delete_document(document_id):
 
 def doc_to_dict(doc: GeneratedDocument, include_details: bool = False) -> dict:
     """Converte documento para dicionário"""
-    result = {
-        'id': str(doc.id),
-        'name': doc.name,
-        'status': doc.status,
-        'google_doc_url': doc.google_doc_url,
-        'pdf_url': doc.pdf_url,
-        'source_object_type': doc.source_object_type,
-        'source_object_id': doc.source_object_id,
-        'generated_at': doc.generated_at.isoformat() if doc.generated_at else None,
-        'created_at': doc.created_at.isoformat()
-    }
-    
-    if include_details:
-        result.update({
-            'workflow_id': str(doc.workflow_id) if doc.workflow_id else None,
-            'template_id': str(doc.template_id) if doc.template_id else None,
-            'generated_data': doc.generated_data,
-            'error_message': doc.error_message
-        })
-    
+    # Usar o método to_dict do modelo que já inclui informações do HubSpot
+    result = doc.to_dict(include_details=include_details)
     return result
 

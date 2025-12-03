@@ -26,6 +26,11 @@ class GeneratedDocument(db.Model):
     pdf_file_id = db.Column(db.String(255))
     pdf_url = db.Column(db.String(500))
     
+    # HubSpot attachment (if attached)
+    hubspot_file_id = db.Column(db.String(255))
+    hubspot_file_url = db.Column(db.String(500))
+    hubspot_attachment_id = db.Column(db.String(255))  # ID do engagement criado
+    
     # Status
     status = db.Column(db.String(50), default='generating')
     # generating, generated, error, sent_for_signature, signed, expired
@@ -54,6 +59,13 @@ class GeneratedDocument(db.Model):
             'generated_at': self.generated_at.isoformat() if self.generated_at else None,
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
+        
+        # Incluir informações do HubSpot se disponíveis
+        if self.hubspot_file_id:
+            result['hubspot_file_id'] = self.hubspot_file_id
+            result['hubspot_file_url'] = self.hubspot_file_url
+            if self.hubspot_attachment_id:
+                result['hubspot_attachment_id'] = self.hubspot_attachment_id
         
         if include_details:
             result.update({
