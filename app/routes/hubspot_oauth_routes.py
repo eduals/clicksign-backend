@@ -27,7 +27,7 @@ def authorize():
         return jsonify({'error': 'HUBSPOT_CLIENT_ID não configurado'}), 500
     
     # Usar localhost como padrão para desenvolvimento
-    redirect_uri = os.getenv('HUBSPOT_REDIRECT_URI', 'http://localhost:5000/api/v1/hubspot-oauth/callback')
+    redirect_uri = os.getenv('HUBSPOT_REDIRECT_URI', '')
     
     scopes = [
         'oauth',
@@ -95,7 +95,7 @@ def oauth_callback():
     try:
         # IMPORTANTE: O redirect_uri deve ser EXATAMENTE o mesmo usado na autorização
         # Usar o mesmo valor padrão do authorize
-        redirect_uri = os.getenv('HUBSPOT_REDIRECT_URI', 'http://localhost:5000/api/v1/hubspot-oauth/callback')
+        redirect_uri = os.getenv('HUBSPOT_REDIRECT_URI', '')
         client_id = os.getenv('HUBSPOT_CLIENT_ID')
         client_secret = os.getenv('HUBSPOT_CLIENT_SECRET')
         
