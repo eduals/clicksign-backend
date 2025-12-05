@@ -3,6 +3,7 @@ from app.database import db
 from app.models import DataSourceConnection
 from app.services.data_sources.hubspot import HubSpotDataSource
 from app.utils.auth import require_auth, require_org, require_admin
+from app.utils.hubspot_auth import flexible_hubspot_auth
 from app.utils.encryption import encrypt_credentials, decrypt_credentials
 import logging
 
