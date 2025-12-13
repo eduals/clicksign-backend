@@ -5,6 +5,7 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 import logging
 import time
+import requests
 
 from app.database import db
 from app.models import Workflow, WorkflowNode, WorkflowExecution, GeneratedDocument
@@ -76,8 +77,20 @@ class TriggerNodeExecutor(NodeExecutor):
     """Executor para trigger nodes"""
     
     def execute(self, node: WorkflowNode, context: ExecutionContext) -> ExecutionContext:
-        """Extrai dados do HubSpot baseado na configuração do trigger"""
+        """Extrai dados baseado na configuração do trigger"""
         config = node.config or {}
+        trigger_type = config.get('trigger_type', 'hubspot')
+        
+        if trigger_type == 'webhook':
+            # Para webhook trigger, os dados já vêm no context.source_data
+            # Apenas validar que existem
+            if not context.source_data:
+                raise ValueError('source_data não encontrado no context (webhook trigger)')
+            context.metadata['current_node_position'] = node.position
+            logger.info(f"Webhook trigger node executado: dados recebidos do webhook")
+            return context
+        
+        # Trigger HubSpot (comportamento original)
         source_connection_id = config.get('source_connection_id')
         source_object_type = config.get('source_object_type') or context.source_object_type
         
@@ -255,6 +268,760 @@ class GoogleDocsNodeExecutor(NodeExecutor):
         return context
 
 
+class MicrosoftWordNodeExecutor(NodeExecutor):
+    """Executor para Microsoft Word nodes"""
+    
+    def execute(self, node: WorkflowNode, context: ExecutionContext) -> ExecutionContext:
+        """Gera documento no Microsoft Word"""
+        from app.services.document_generation.microsoft_word import MicrosoftWordService
+        from app.models import Template, GeneratedDocument, DataSourceConnection
+        from datetime import datetime
+        from app.services.document_generation.tag_processor import TagProcessor
+        
+        config = node.config or {}
+        template_id = config.get('template_id')
+        connection_id = config.get('connection_id')
+        
+        if not template_id:
+            raise ValueError('template_id não configurado no Microsoft Word node')
+        
+        if not connection_id:
+            raise ValueError('connection_id não configurado no Microsoft Word node')
+        
+        # Buscar template
+        template = Template.query.get(template_id)
+        if not template:
+            raise ValueError(f'Template não encontrado: {template_id}')
+        
+        # Buscar workflow para obter organization_id
+        workflow = Workflow.query.get(context.workflow_id)
+        if not workflow:
+            raise ValueError(f'Workflow não encontrado: {context.workflow_id}')
+        
+        # Buscar conexão Microsoft
+        connection = DataSourceConnection.query.filter_by(
+            id=connection_id,
+            organization_id=workflow.organization_id,
+            source_type='microsoft'
+        ).first()
+        
+        if not connection:
+            raise ValueError(f'Conexão Microsoft não encontrada: {connection_id}')
+        
+        # Obter access token
+        credentials = connection.get_decrypted_credentials()
+        access_token = credentials.get('access_token')
+        
+        if not access_token:
+            raise ValueError('Access token não encontrado na conexão Microsoft')
+        
+        # Verificar se token expirou e renovar se necessário
+        expires_at_str = credentials.get('expires_at')
+        if expires_at_str:
+            expires_at = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00'))
+            if expires_at < datetime.utcnow():
+                # Renovar token
+                from app.routes.microsoft_oauth_routes import _refresh_microsoft_token
+                if not _refresh_microsoft_token(connection):
+                    raise ValueError('Não foi possível renovar token Microsoft')
+                credentials = connection.get_decrypted_credentials()
+                access_token = credentials.get('access_token')
+        
+        # Criar serviço
+        word_service = MicrosoftWordService(access_token)
+        
+        # Buscar field mappings do node
+        field_mappings_data = config.get('field_mappings', [])
+        mappings = {}
+        for mapping_data in field_mappings_data:
+            template_tag = mapping_data.get('template_tag')
+            source_field = mapping_data.get('source_field')
+            if template_tag and source_field:
+                mappings[template_tag] = source_field
+        
+        # Gerar nome do documento
+        output_name_template = config.get('output_name_template', '{{object_type}} - {{timestamp}}')
+        
+        # Adicionar campos especiais para o template de nome
+        data_with_meta = {
+            **context.source_data,
+            'date': datetime.utcnow().strftime('%Y-%m-%d'),
+            'timestamp': datetime.utcnow().strftime('%Y%m%d_%H%M%S'),
+            'object_type': context.source_object_type
+        }
+        
+        doc_name = TagProcessor.replace_tags(output_name_template, data_with_meta)
+        
+        # Copiar template
+        new_doc = word_service.copy_template(
+            template_id=template.microsoft_file_id or template.google_file_id,  # Fallback para google_file_id
+            new_name=doc_name,
+            folder_id=config.get('output_folder_id')
+        )
+        
+        # Processar AI mappings (se houver)
+        ai_replacements = {}
+        ai_mappings = list(workflow.ai_mappings)
+        if ai_mappings:
+            # TODO: Implementar processamento de AI tags para Word
+            # Por enquanto, apenas log
+            logger.info(f'AI mappings encontrados mas não processados para Word: {len(ai_mappings)}')
+        
+        # Combinar dados
+        combined_data = {**context.source_data, **ai_replacements}
+        
+        # Substituir tags
+        word_service.replace_tags_in_document(
+            document_id=new_doc['id'],
+            data=combined_data,
+            mappings=mappings
+        )
+        
+        # Gerar PDF se configurado
+        pdf_result = None
+        if config.get('create_pdf', True):
+            try:
+                pdf_bytes = word_service.export_as_pdf(new_doc['id'])
+                # Upload PDF para OneDrive
+                pdf_name = f"{doc_name}.pdf"
+                pdf_upload_response = requests.put(
+                    f'https://graph.microsoft.com/v1.0/me/drive/items/{config.get("output_folder_id", "root")}/children/{pdf_name}/content',
+                    headers={'Authorization': f'Bearer {access_token}'},
+                    data=pdf_bytes
+                )
+                if pdf_upload_response.ok:
+                    pdf_file = pdf_upload_response.json()
+                    pdf_result = {
+                        'id': pdf_file['id'],
+                        'url': pdf_file.get('webUrl')
+                    }
+            except Exception as e:
+                logger.warning(f'Erro ao gerar PDF do Word: {str(e)}')
+        
+        # Criar registro do documento
+        generated_doc = GeneratedDocument(
+            organization_id=workflow.organization_id,
+            workflow_id=workflow.id,
+            source_connection_id=workflow.source_connection_id,
+            source_object_type=context.source_object_type,
+            source_object_id=context.source_object_id,
+            template_id=template.id,
+            template_version=template.version,
+            name=doc_name,
+            google_doc_id=new_doc['id'],  # Reutilizar campo para Microsoft file ID
+            google_doc_url=new_doc['url'],
+            status='generated',
+            generated_data=context.source_data,
+            generated_at=datetime.utcnow()
+        )
+        
+        if pdf_result:
+            generated_doc.pdf_file_id = pdf_result['id']
+            generated_doc.pdf_url = pdf_result['url']
+        
+        db.session.add(generated_doc)
+        db.session.commit()
+        
+        # Adicionar ao context
+        context.generated_documents.append({
+            'node_id': str(node.id),
+            'document_id': str(generated_doc.id),
+            'microsoft_file_id': new_doc['id'],
+            'microsoft_file_url': new_doc['url'],
+            'pdf_file_id': pdf_result['id'] if pdf_result else None,
+            'pdf_url': pdf_result['url'] if pdf_result else None
+        })
+        
+        context.metadata['current_node_position'] = node.position
+        
+        logger.info(f"Microsoft Word node executado: documento {generated_doc.id} gerado")
+        
+        return context
+
+
+class GoogleSlidesNodeExecutor(NodeExecutor):
+    """Executor para Google Slides nodes"""
+    
+    def execute(self, node: WorkflowNode, context: ExecutionContext) -> ExecutionContext:
+        """Gera apresentação no Google Slides"""
+        from app.services.document_generation.generator import DocumentGenerator
+        from app.services.document_generation.google_slides import GoogleSlidesService
+        from app.routes.google_drive_routes import get_google_credentials
+        from app.models import Template, GeneratedDocument
+        from datetime import datetime
+        from app.services.document_generation.tag_processor import TagProcessor
+        
+        config = node.config or {}
+        template_id = config.get('template_id')
+        
+        if not template_id:
+            raise ValueError('template_id não configurado no Google Slides node')
+        
+        # Buscar template
+        template = Template.query.get(template_id)
+        if not template:
+            raise ValueError(f'Template não encontrado: {template_id}')
+        
+        # Buscar workflow
+        workflow = Workflow.query.get(context.workflow_id)
+        if not workflow:
+            raise ValueError(f'Workflow não encontrado: {context.workflow_id}')
+        
+        # Obter credenciais do Google
+        google_creds = get_google_credentials(workflow.organization_id)
+        if not google_creds:
+            raise ValueError('Credenciais do Google não configuradas')
+        
+        # Criar serviço
+        slides_service = GoogleSlidesService(google_creds)
+        
+        # Buscar field mappings
+        field_mappings_data = config.get('field_mappings', [])
+        mappings = {}
+        for mapping_data in field_mappings_data:
+            template_tag = mapping_data.get('template_tag')
+            source_field = mapping_data.get('source_field')
+            if template_tag and source_field:
+                mappings[template_tag] = source_field
+        
+        # Gerar nome da apresentação
+        output_name_template = config.get('output_name_template', '{{object_type}} - {{timestamp}}')
+        
+        data_with_meta = {
+            **context.source_data,
+            'date': datetime.utcnow().strftime('%Y-%m-%d'),
+            'timestamp': datetime.utcnow().strftime('%Y%m%d_%H%M%S'),
+            'object_type': context.source_object_type
+        }
+        
+        pres_name = TagProcessor.replace_tags(output_name_template, data_with_meta)
+        
+        # Copiar template
+        new_pres = slides_service.copy_template(
+            template_id=template.google_file_id,
+            new_name=pres_name,
+            folder_id=config.get('output_folder_id')
+        )
+        
+        # Processar AI mappings
+        ai_replacements = {}
+        ai_mappings = list(workflow.ai_mappings)
+        if ai_mappings:
+            from app.services.document_generation.generator import AIGenerationMetrics
+            ai_metrics = AIGenerationMetrics()
+            generator = DocumentGenerator(google_creds)
+            ai_replacements = generator._process_ai_tags(
+                workflow=workflow,
+                source_data=context.source_data,
+                metrics=ai_metrics
+            )
+        
+        # Combinar dados
+        combined_data = {**context.source_data, **ai_replacements}
+        
+        # Substituir tags
+        slides_service.replace_tags_in_presentation(
+            presentation_id=new_pres['id'],
+            data=combined_data,
+            mappings=mappings
+        )
+        
+        # Gerar PDF se configurado
+        pdf_result = None
+        if config.get('create_pdf', True):
+            pdf_bytes = slides_service.export_as_pdf(new_pres['id'])
+            # Upload PDF para Google Drive
+            from app.services.document_generation.generator import DocumentGenerator
+            generator = DocumentGenerator(google_creds)
+            pdf_result = generator._upload_pdf(
+                pdf_bytes,
+                f"{pres_name}.pdf",
+                config.get('output_folder_id')
+            )
+        
+        # Criar registro do documento
+        generated_doc = GeneratedDocument(
+            organization_id=workflow.organization_id,
+            workflow_id=workflow.id,
+            source_connection_id=workflow.source_connection_id,
+            source_object_type=context.source_object_type,
+            source_object_id=context.source_object_id,
+            template_id=template.id,
+            template_version=template.version,
+            name=pres_name,
+            google_doc_id=new_pres['id'],
+            google_doc_url=new_pres['url'],
+            status='generated',
+            generated_data=context.source_data,
+            generated_at=datetime.utcnow()
+        )
+        
+        if pdf_result:
+            generated_doc.pdf_file_id = pdf_result['id']
+            generated_doc.pdf_url = pdf_result['url']
+        
+        db.session.add(generated_doc)
+        db.session.commit()
+        
+        # Adicionar ao context
+        context.generated_documents.append({
+            'node_id': str(node.id),
+            'document_id': str(generated_doc.id),
+            'google_slides_id': new_pres['id'],
+            'google_slides_url': new_pres['url'],
+            'pdf_file_id': pdf_result['id'] if pdf_result else None,
+            'pdf_url': pdf_result['url'] if pdf_result else None
+        })
+        
+        context.metadata['current_node_position'] = node.position
+        
+        logger.info(f"Google Slides node executado: apresentação {generated_doc.id} gerada")
+        
+        return context
+
+
+class MicrosoftPowerPointNodeExecutor(NodeExecutor):
+    """Executor para Microsoft PowerPoint nodes"""
+    
+    def execute(self, node: WorkflowNode, context: ExecutionContext) -> ExecutionContext:
+        """Gera apresentação no Microsoft PowerPoint"""
+        from app.services.document_generation.microsoft_powerpoint import MicrosoftPowerPointService
+        from app.models import Template, GeneratedDocument, DataSourceConnection
+        from datetime import datetime
+        from app.services.document_generation.tag_processor import TagProcessor
+        
+        config = node.config or {}
+        template_id = config.get('template_id')
+        connection_id = config.get('connection_id')
+        
+        if not template_id:
+            raise ValueError('template_id não configurado no Microsoft PowerPoint node')
+        
+        if not connection_id:
+            raise ValueError('connection_id não configurado no Microsoft PowerPoint node')
+        
+        # Buscar template
+        template = Template.query.get(template_id)
+        if not template:
+            raise ValueError(f'Template não encontrado: {template_id}')
+        
+        # Buscar workflow
+        workflow = Workflow.query.get(context.workflow_id)
+        if not workflow:
+            raise ValueError(f'Workflow não encontrado: {context.workflow_id}')
+        
+        # Buscar conexão Microsoft
+        connection = DataSourceConnection.query.filter_by(
+            id=connection_id,
+            organization_id=workflow.organization_id,
+            source_type='microsoft'
+        ).first()
+        
+        if not connection:
+            raise ValueError(f'Conexão Microsoft não encontrada: {connection_id}')
+        
+        # Obter access token
+        credentials = connection.get_decrypted_credentials()
+        access_token = credentials.get('access_token')
+        
+        if not access_token:
+            raise ValueError('Access token não encontrado na conexão Microsoft')
+        
+        # Verificar se token expirou e renovar se necessário
+        expires_at_str = credentials.get('expires_at')
+        if expires_at_str:
+            expires_at = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00'))
+            if expires_at < datetime.utcnow():
+                from app.routes.microsoft_oauth_routes import _refresh_microsoft_token
+                if not _refresh_microsoft_token(connection):
+                    raise ValueError('Não foi possível renovar token Microsoft')
+                credentials = connection.get_decrypted_credentials()
+                access_token = credentials.get('access_token')
+        
+        # Criar serviço
+        ppt_service = MicrosoftPowerPointService(access_token)
+        
+        # Buscar field mappings
+        field_mappings_data = config.get('field_mappings', [])
+        mappings = {}
+        for mapping_data in field_mappings_data:
+            template_tag = mapping_data.get('template_tag')
+            source_field = mapping_data.get('source_field')
+            if template_tag and source_field:
+                mappings[template_tag] = source_field
+        
+        # Gerar nome da apresentação
+        output_name_template = config.get('output_name_template', '{{object_type}} - {{timestamp}}')
+        
+        data_with_meta = {
+            **context.source_data,
+            'date': datetime.utcnow().strftime('%Y-%m-%d'),
+            'timestamp': datetime.utcnow().strftime('%Y%m%d_%H%M%S'),
+            'object_type': context.source_object_type
+        }
+        
+        pres_name = TagProcessor.replace_tags(output_name_template, data_with_meta)
+        
+        # Copiar template
+        new_pres = ppt_service.copy_template(
+            template_id=template.microsoft_file_id or template.google_file_id,
+            new_name=pres_name,
+            folder_id=config.get('output_folder_id')
+        )
+        
+        # Processar AI mappings (se houver)
+        ai_replacements = {}
+        ai_mappings = list(workflow.ai_mappings)
+        if ai_mappings:
+            logger.info(f'AI mappings encontrados mas não processados para PowerPoint: {len(ai_mappings)}')
+        
+        # Combinar dados
+        combined_data = {**context.source_data, **ai_replacements}
+        
+        # Substituir tags
+        ppt_service.replace_tags_in_presentation(
+            presentation_id=new_pres['id'],
+            data=combined_data,
+            mappings=mappings
+        )
+        
+        # Gerar PDF se configurado
+        pdf_result = None
+        if config.get('create_pdf', True):
+            try:
+                pdf_bytes = ppt_service.export_as_pdf(new_pres['id'])
+                pdf_name = f"{pres_name}.pdf"
+                pdf_upload_response = requests.put(
+                    f'https://graph.microsoft.com/v1.0/me/drive/items/{config.get("output_folder_id", "root")}/children/{pdf_name}/content',
+                    headers={'Authorization': f'Bearer {access_token}'},
+                    data=pdf_bytes
+                )
+                if pdf_upload_response.ok:
+                    pdf_file = pdf_upload_response.json()
+                    pdf_result = {
+                        'id': pdf_file['id'],
+                        'url': pdf_file.get('webUrl')
+                    }
+            except Exception as e:
+                logger.warning(f'Erro ao gerar PDF do PowerPoint: {str(e)}')
+        
+        # Criar registro do documento
+        generated_doc = GeneratedDocument(
+            organization_id=workflow.organization_id,
+            workflow_id=workflow.id,
+            source_connection_id=workflow.source_connection_id,
+            source_object_type=context.source_object_type,
+            source_object_id=context.source_object_id,
+            template_id=template.id,
+            template_version=template.version,
+            name=pres_name,
+            google_doc_id=new_pres['id'],  # Reutilizar campo
+            google_doc_url=new_pres['url'],
+            status='generated',
+            generated_data=context.source_data,
+            generated_at=datetime.utcnow()
+        )
+        
+        if pdf_result:
+            generated_doc.pdf_file_id = pdf_result['id']
+            generated_doc.pdf_url = pdf_result['url']
+        
+        db.session.add(generated_doc)
+        db.session.commit()
+        
+        # Adicionar ao context
+        context.generated_documents.append({
+            'node_id': str(node.id),
+            'document_id': str(generated_doc.id),
+            'microsoft_file_id': new_pres['id'],
+            'microsoft_file_url': new_pres['url'],
+            'pdf_file_id': pdf_result['id'] if pdf_result else None,
+            'pdf_url': pdf_result['url'] if pdf_result else None
+        })
+        
+        context.metadata['current_node_position'] = node.position
+        
+        logger.info(f"Microsoft PowerPoint node executado: apresentação {generated_doc.id} gerada")
+        
+        return context
+
+
+class GmailEmailNodeExecutor(NodeExecutor):
+    """Executor para Gmail email nodes"""
+    
+    def execute(self, node: WorkflowNode, context: ExecutionContext) -> ExecutionContext:
+        """Envia email via Gmail SMTP"""
+        from app.services.email_service import EmailService
+        from app.models import DataSourceConnection, GeneratedDocument
+        from app.services.document_generation.tag_processor import TagProcessor
+        
+        config = node.config or {}
+        connection_id = config.get('connection_id')
+        
+        if not connection_id:
+            raise ValueError('connection_id não configurado no Gmail email node')
+        
+        # Buscar workflow
+        workflow = Workflow.query.get(context.workflow_id)
+        if not workflow:
+            raise ValueError(f'Workflow não encontrado: {context.workflow_id}')
+        
+        # Buscar conexão Gmail SMTP
+        connection = DataSourceConnection.query.filter_by(
+            id=connection_id,
+            organization_id=workflow.organization_id,
+            source_type='gmail_smtp'
+        ).first()
+        
+        if not connection:
+            raise ValueError(f'Conexão Gmail SMTP não encontrada: {connection_id}')
+        
+        # Obter credenciais
+        credentials = connection.get_decrypted_credentials()
+        smtp_host = credentials.get('smtp_host', 'smtp.gmail.com')
+        smtp_port = credentials.get('smtp_port', 587)
+        username = credentials.get('username')
+        password = credentials.get('password')
+        use_tls = credentials.get('use_tls', True)
+        
+        if not username or not password:
+            raise ValueError('Credenciais SMTP incompletas')
+        
+        # Processar templates de email
+        to_emails = config.get('to', [])
+        subject_template = config.get('subject_template', '')
+        body_template = config.get('body_template', '')
+        body_type = config.get('body_type', 'html')
+        
+        # Substituir tags
+        data = context.source_data
+        to_processed = [TagProcessor.replace_tags(email, data) for email in to_emails]
+        subject = TagProcessor.replace_tags(subject_template, data)
+        body = TagProcessor.replace_tags(body_template, data)
+        
+        # Processar anexos se configurado
+        attachments = []
+        if config.get('attach_documents', False):
+            document_node_ids = config.get('document_node_ids', [])
+            for doc_info in context.generated_documents:
+                if str(doc_info.get('node_id')) in document_node_ids:
+                    # Buscar documento gerado
+                    doc = GeneratedDocument.query.get(doc_info.get('document_id'))
+                    if doc and doc.pdf_file_id:
+                        # Baixar PDF
+                        # TODO: Implementar download do PDF do Google Drive ou OneDrive
+                        # Por enquanto, apenas log
+                        logger.info(f'Documento {doc.id} seria anexado, mas download não implementado')
+        
+        # Enviar email
+        EmailService.send_via_smtp(
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            username=username,
+            password=password,
+            use_tls=use_tls,
+            to=to_processed,
+            subject=subject,
+            body=body,
+            body_type=body_type,
+            cc=config.get('cc', []),
+            bcc=config.get('bcc', []),
+            attachments=attachments if attachments else None
+        )
+        
+        context.metadata['current_node_position'] = node.position
+        logger.info(f"Gmail email node executado: email enviado para {to_processed}")
+        
+        return context
+
+
+class OutlookEmailNodeExecutor(NodeExecutor):
+    """Executor para Outlook email nodes"""
+    
+    def execute(self, node: WorkflowNode, context: ExecutionContext) -> ExecutionContext:
+        """Envia email via Outlook (Microsoft Graph API)"""
+        from app.services.email_service import EmailService
+        from app.models import DataSourceConnection, GeneratedDocument
+        from app.services.document_generation.tag_processor import TagProcessor
+        from datetime import datetime
+        
+        config = node.config or {}
+        connection_id = config.get('connection_id')
+        
+        if not connection_id:
+            raise ValueError('connection_id não configurado no Outlook email node')
+        
+        # Buscar workflow
+        workflow = Workflow.query.get(context.workflow_id)
+        if not workflow:
+            raise ValueError(f'Workflow não encontrado: {context.workflow_id}')
+        
+        # Buscar conexão Microsoft
+        connection = DataSourceConnection.query.filter_by(
+            id=connection_id,
+            organization_id=workflow.organization_id,
+            source_type='microsoft'
+        ).first()
+        
+        if not connection:
+            raise ValueError(f'Conexão Microsoft não encontrada: {connection_id}')
+        
+        # Obter access token
+        credentials = connection.get_decrypted_credentials()
+        access_token = credentials.get('access_token')
+        from_email = credentials.get('user_email')
+        
+        if not access_token or not from_email:
+            raise ValueError('Access token ou email não encontrado na conexão Microsoft')
+        
+        # Verificar se token expirou e renovar se necessário
+        expires_at_str = credentials.get('expires_at')
+        if expires_at_str:
+            expires_at = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00'))
+            if expires_at < datetime.utcnow():
+                from app.routes.microsoft_oauth_routes import _refresh_microsoft_token
+                if not _refresh_microsoft_token(connection):
+                    raise ValueError('Não foi possível renovar token Microsoft')
+                credentials = connection.get_decrypted_credentials()
+                access_token = credentials.get('access_token')
+        
+        # Processar templates de email
+        to_emails = config.get('to', [])
+        subject_template = config.get('subject_template', '')
+        body_template = config.get('body_template', '')
+        body_type = config.get('body_type', 'html')
+        
+        # Substituir tags
+        data = context.source_data
+        to_processed = [TagProcessor.replace_tags(email, data) for email in to_emails]
+        subject = TagProcessor.replace_tags(subject_template, data)
+        body = TagProcessor.replace_tags(body_template, data)
+        
+        # Processar anexos se configurado
+        attachments = []
+        if config.get('attach_documents', False):
+            document_node_ids = config.get('document_node_ids', [])
+            for doc_info in context.generated_documents:
+                if str(doc_info.get('node_id')) in document_node_ids:
+                    # Buscar documento gerado
+                    doc = GeneratedDocument.query.get(doc_info.get('document_id'))
+                    if doc and doc.pdf_file_id:
+                        # TODO: Implementar download do PDF
+                        logger.info(f'Documento {doc.id} seria anexado, mas download não implementado')
+        
+        # Enviar email
+        EmailService.send_via_graph_api(
+            access_token=access_token,
+            from_email=from_email,
+            to=to_processed,
+            subject=subject,
+            body=body,
+            body_type=body_type,
+            cc=config.get('cc', []),
+            bcc=config.get('bcc', []),
+            attachments=attachments if attachments else None
+        )
+        
+        context.metadata['current_node_position'] = node.position
+        logger.info(f"Outlook email node executado: email enviado para {to_processed}")
+        
+        return context
+
+
+class HumanInLoopNodeExecutor(NodeExecutor):
+    """Executor para Human-in-the-Loop nodes (aprovação)"""
+    
+    def execute(self, node: WorkflowNode, context: ExecutionContext) -> ExecutionContext:
+        """Pausa execução e cria aprovação"""
+        from app.models import WorkflowApproval, WorkflowExecution
+        from datetime import datetime, timedelta
+        import secrets
+        
+        config = node.config or {}
+        approver_emails = config.get('approver_emails', [])
+        message_template = config.get('message_template', 'Por favor, revise os documentos gerados e aprove ou rejeite.')
+        timeout_hours = config.get('timeout_hours', 48)
+        auto_approve_on_timeout = config.get('auto_approve_on_timeout', False)
+        
+        if not approver_emails:
+            raise ValueError('approver_emails não configurado no Human-in-Loop node')
+        
+        # Buscar execução atual
+        execution = WorkflowExecution.query.filter_by(
+            workflow_id=context.workflow_id,
+            status='running'
+        ).order_by(WorkflowExecution.created_at.desc()).first()
+        
+        if not execution:
+            raise ValueError('Execução não encontrada')
+        
+        # Coletar URLs dos documentos gerados
+        document_urls = []
+        for doc_info in context.generated_documents:
+            if doc_info.get('pdf_url'):
+                document_urls.append({
+                    'name': doc_info.get('name', 'Documento'),
+                    'url': doc_info.get('pdf_url')
+                })
+            elif doc_info.get('google_doc_url'):
+                document_urls.append({
+                    'name': doc_info.get('name', 'Documento'),
+                    'url': doc_info.get('google_doc_url')
+                })
+            elif doc_info.get('microsoft_file_url'):
+                document_urls.append({
+                    'name': doc_info.get('name', 'Documento'),
+                    'url': doc_info.get('microsoft_file_url')
+                })
+        
+        # Criar aprovação para cada aprovador
+        approvals = []
+        for approver_email in approver_emails:
+            approval = WorkflowApproval(
+                workflow_execution_id=execution.id,
+                workflow_id=context.workflow_id,
+                node_id=node.id,
+                execution_context={
+                    'source_object_id': context.source_object_id,
+                    'source_object_type': context.source_object_type,
+                    'source_data': context.source_data,
+                    'metadata': context.metadata,
+                    'generated_documents': context.generated_documents
+                },
+                approver_email=approver_email,
+                approval_token=secrets.token_urlsafe(32),
+                status='pending',
+                message_template=message_template,
+                timeout_hours=timeout_hours,
+                auto_approve_on_timeout=auto_approve_on_timeout,
+                document_urls=document_urls,
+                expires_at=datetime.utcnow() + timedelta(hours=timeout_hours)
+            )
+            db.session.add(approval)
+            approvals.append(approval)
+        
+        # Marcar execução como pausada
+        execution.status = 'paused'
+        db.session.commit()
+        
+        # Enviar emails de aprovação
+        # TODO: Implementar envio de emails com links de aprovação
+        # Por enquanto, apenas log
+        for approval in approvals:
+            approval_url = f"https://app.exemplo.com/approve/{approval.approval_token}"
+            logger.info(f'Link de aprovação para {approval.approver_email}: {approval_url}')
+        
+        # Não continuar para próximo node (execução pausada)
+        # A execução será retomada quando a aprovação for aprovada/rejeitada
+        context.metadata['current_node_position'] = node.position
+        context.metadata['paused'] = True
+        context.metadata['approval_ids'] = [str(a.id) for a in approvals]
+        
+        logger.info(f"Human-in-Loop node executado: execução pausada, {len(approvals)} aprovações criadas")
+        
+        return context
+
+
 class ClicksignNodeExecutor(NodeExecutor):
     """Executor para Clicksign nodes"""
     
@@ -369,6 +1136,12 @@ class WorkflowExecutor:
         self.executors = {
             'trigger': TriggerNodeExecutor(),
             'google-docs': GoogleDocsNodeExecutor(),
+            'google-slides': GoogleSlidesNodeExecutor(),
+            'microsoft-word': MicrosoftWordNodeExecutor(),
+            'microsoft-powerpoint': MicrosoftPowerPointNodeExecutor(),
+            'gmail': GmailEmailNodeExecutor(),
+            'outlook': OutlookEmailNodeExecutor(),
+            'human-in-loop': HumanInLoopNodeExecutor(),
             'clicksign': ClicksignNodeExecutor(),
             'webhook': WebhookNodeExecutor()
         }

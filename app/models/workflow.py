@@ -214,6 +214,9 @@ class WorkflowNode(db.Model):
     # Para clicksign: { connection_id, recipients, document_source, document_id }
     # Para webhook: { url, method, headers, body_template }
     
+    # Webhook token (para triggers webhook)
+    webhook_token = db.Column(db.String(255), unique=True, nullable=True)
+    
     # Status
     status = db.Column(db.String(50), default='draft')  # draft, configured, active
     
@@ -254,6 +257,12 @@ class WorkflowNode(db.Model):
         """Verifica se é o node trigger"""
         return self.node_type == 'trigger'
     
+    def generate_webhook_token(self):
+        """Gera token único para webhook trigger"""
+        import secrets
+        self.webhook_token = secrets.token_urlsafe(32)
+        return self.webhook_token
+    
     def is_configured(self):
         """Verifica se o node está configurado"""
         if self.status == 'configured':
@@ -264,9 +273,25 @@ class WorkflowNode(db.Model):
             return False
         
         if self.node_type == 'trigger':
-            return bool(self.config.get('source_connection_id') and self.config.get('source_object_type'))
+            trigger_type = self.config.get('trigger_type', 'hubspot')
+            if trigger_type == 'webhook':
+                return bool(self.webhook_token and self.config.get('field_mapping'))
+            else:
+                return bool(self.config.get('source_connection_id') and self.config.get('source_object_type'))
         elif self.node_type == 'google-docs':
             return bool(self.config.get('template_id'))
+        elif self.node_type == 'google-slides':
+            return bool(self.config.get('template_id'))
+        elif self.node_type == 'microsoft-word':
+            return bool(self.config.get('template_id') and self.config.get('connection_id'))
+        elif self.node_type == 'microsoft-powerpoint':
+            return bool(self.config.get('template_id') and self.config.get('connection_id'))
+        elif self.node_type == 'gmail':
+            return bool(self.config.get('connection_id') and self.config.get('to') and self.config.get('subject_template'))
+        elif self.node_type == 'outlook':
+            return bool(self.config.get('connection_id') and self.config.get('to') and self.config.get('subject_template'))
+        elif self.node_type == 'human-in-loop':
+            return bool(self.config.get('approver_emails'))
         elif self.node_type == 'clicksign':
             return bool(self.config.get('connection_id') and self.config.get('recipients'))
         elif self.node_type == 'webhook':

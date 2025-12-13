@@ -14,6 +14,9 @@ class Template(db.Model):
     google_file_type = db.Column(db.String(50), nullable=False)  # document, presentation
     google_file_url = db.Column(db.String(500))
     thumbnail_url = db.Column(db.String(500))
+    # Microsoft fields
+    microsoft_file_id = db.Column(db.String(255))  # ID do arquivo no OneDrive/SharePoint
+    microsoft_file_type = db.Column(db.String(50))  # 'word', 'powerpoint'
     detected_tags = db.Column(JSONB)  # ["contact.firstname", "deal.amount", ...]
     version = db.Column(db.Integer, default=1)
     last_synced_at = db.Column(db.DateTime)

@@ -174,11 +174,13 @@ def create_workflow():
     db.session.flush()  # Para obter o ID
     
     # Criar trigger node automaticamente
+    trigger_type = data.get('trigger_type', 'manual')
     trigger_config = {
-        'trigger_type': data.get('trigger_type', 'manual'),
+        'trigger_type': trigger_type,
         'source_connection_id': str(data.get('source_connection_id')) if data.get('source_connection_id') else None,
         'source_object_type': data.get('source_object_type'),
-        'trigger_config': data.get('trigger_config', {})
+        'trigger_config': data.get('trigger_config', {}),
+        'field_mapping': data.get('field_mapping', {})  # Para webhook trigger
     }
     
     trigger_node = WorkflowNode(
@@ -189,6 +191,10 @@ def create_workflow():
         config=trigger_config,
         status='draft'
     )
+    
+    # Se for webhook trigger, gerar token
+    if trigger_type == 'webhook':
+        trigger_node.generate_webhook_token()
     
     db.session.add(trigger_node)
     db.session.commit()
@@ -688,7 +694,7 @@ def create_workflow_node(workflow_id):
         return jsonify({'error': 'node_type é obrigatório'}), 400
     
     node_type = data['node_type']
-    valid_types = ['trigger', 'google-docs', 'clicksign', 'webhook']
+    valid_types = ['trigger', 'google-docs', 'google-slides', 'microsoft-word', 'microsoft-powerpoint', 'gmail', 'outlook', 'clicksign', 'webhook', 'human-in-loop']
     if node_type not in valid_types:
         return jsonify({
             'error': f'node_type deve ser um de: {", ".join(valid_types)}'
